@@ -360,7 +360,9 @@ app.post("/api/pay", async (req, res) => {
     if (!r.ok) {
       const err = await r.json().catch(() => ({}));
       console.error("[pinpay] falha ao criar cobrança", r.status, err);
-      return res.status(502).json({ error: "gateway_error" });
+      // TEMP-DEBUG: expõe o erro real da PinPay na resposta pra diagnosticar
+      // o 502 na primeira ativação. Remover assim que confirmarmos a causa.
+      return res.status(502).json({ error: "gateway_error", debug: { status: r.status, body: err } });
     }
 
     const pix = await r.json();
