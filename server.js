@@ -8,14 +8,8 @@ const PORT = process.env.PORT || 3000;
 const PINPAY_BASE = "https://api.usepinpay.com/functions/v1/api-v1";
 const UTMIFY_ORDERS_URL = "https://api.utmify.com.br/api-credentials/orders";
 
-// CORS_ORIGIN: domínio(s) que podem chamar essa API, separados por vírgula.
-// Sem isso, libera geral (útil só em dev).
-const allowedOrigins = (process.env.CORS_ORIGIN || "").split(",").map((s) => s.trim()).filter(Boolean);
-app.use(
-  cors({
-    origin: allowedOrigins.length ? allowedOrigins : true,
-  })
-);
+// CORS liberado pra qualquer origem — por decisão do projeto, sem restrição de domínio.
+app.use(cors());
 
 function onlyDigits(value) {
   return String(value || "").replace(/\D/g, "");
@@ -341,7 +335,7 @@ app.post("/api/pay", async (req, res) => {
         metadata: {
           external_reference: orderId,
           order_id: orderId,
-          checkout_url: checkoutUrl || (allowedOrigins[0] || ""),
+          checkout_url: checkoutUrl || "",
           created_at: createdAt,
           product,
           amount_cents: String(amount),
@@ -471,6 +465,5 @@ app.get("/health", (req, res) => res.json({ ok: true }));
 app.listen(PORT, () => {
   console.log(`Backend Pix do checkout Sélah (Bíblia de Estudo Para o Cotidiano da Mulher) rodando na porta ${PORT}`);
   if (!process.env.PINPAY_TOKEN) console.warn("⚠️  PINPAY_TOKEN não configurado.");
-  if (!allowedOrigins.length) console.warn("⚠️  CORS_ORIGIN não configurado — aceitando qualquer origem.");
   if (!process.env.UTMIFY_API_TOKEN) console.warn("⚠️  UTMIFY_API_TOKEN não configurado — vendas não vão pra UTMify.");
 });
