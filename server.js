@@ -341,12 +341,7 @@ app.post("/api/pay", async (req, res) => {
     };
     ordersById.set(orderId, rec);
 
-    // TEMP-DEBUG: aguarda e expõe o resultado do envio pra UTMify, só pra
-    // confirmar que o token está certo. Normalmente isso é fire-and-forget.
-    let utmifyDebug = "skipped (sem UTMIFY_API_TOKEN)";
-    if (process.env.UTMIFY_API_TOKEN) {
-      utmifyDebug = await sendUtmifyOrder(rec, "waiting_payment");
-    }
+    sendUtmifyOrder(rec, "waiting_payment").catch(() => {});
 
     return res.status(201).json({
       pix_id: pix.id,
@@ -354,7 +349,6 @@ app.post("/api/pay", async (req, res) => {
       qr_code_image: pix.pix_qr_code || null,
       expires_at: pix.expires_at,
       order_id: orderId,
-      debug_utmify: utmifyDebug,
     });
   } catch (e) {
     console.error("[onyxpag] exceção ao criar cobrança", e);
