@@ -140,13 +140,17 @@ async function sendUtmifyOrder(rec, status, approvedDate = null) {
     });
     if (!r.ok) {
       rec.utmifySent.delete(status);
-      console.error("[utmify] pedido falhou", status, rec.orderId, r.status, await r.text().catch(() => ""));
+      const errText = await r.text().catch(() => "");
+      console.error("[utmify] pedido falhou", status, rec.orderId, r.status, errText);
+      return { ok: false, httpStatus: r.status, body: errText };
     } else {
       console.log("[utmify] pedido enviado", status, rec.orderId);
+      return { ok: true };
     }
   } catch (e) {
     rec.utmifySent.delete(status);
     console.error("[utmify] exceção ao enviar pedido", e.message);
+    return { ok: false, error: e.message };
   }
 }
 
@@ -341,12 +345,7 @@ app.post("/api/pay", async (req, res) => {
     // confirmar que o token está certo. Normalmente isso é fire-and-forget.
     let utmifyDebug = "skipped (sem UTMIFY_API_TOKEN)";
     if (process.env.UTMIFY_API_TOKEN) {
-      try {
-        await sendUtmifyOrder(rec, "waiting_payment");
-        utmifyDebug = rec.utmifySent.has("waiting_payment") ? "ok" : "falhou (ver logs)";
-      } catch (e) {
-        utmifyDebug = "exceção: " + e.message;
-      }
+      utmifyDebug = await sendUtmifyOrder(rec, "waiting_payment");
     }
 
     return res.status(201).json({
