@@ -29,6 +29,18 @@ function formatCPF(digits) {
   return digits.replace(/(\d{3})(\d{3})(\d{3})(\d{2})/, "$1.$2.$3-$4");
 }
 
+// A OnyxPag quebra com erro de charset no banco deles ("Incorrect string
+// value") quando source_label/description/items[].title tem acento ou
+// travessão — confirmado testando com "Bíblia ... — 3 Bíblias". Só usamos
+// essa versão sem acento nos campos que vão pra API deles; o nome certinho
+// continua em tudo que é nosso (UTMify, registro interno).
+function sanitizeForOnyxpag(str) {
+  return String(str || "")
+    .normalize("NFD").replace(/[̀-ͯ]/g, "") // decompõe e remove os acentos (í -> i)
+    .replace(/[–—]/g, "-") // travessão/meia-risca -> hífen
+    .replace(/[^\x00-\x7F]/g, ""); // qualquer outro caractere fora do ASCII
+}
+
 // Gera um CPF com dígitos verificadores válidos — fallback quando o front não
 // mandou um CPF válido (não deveria acontecer: a tela pede e valida antes).
 function genCPF() {
@@ -279,11 +291,11 @@ app.post("/api/pay", async (req, res) => {
         amount: Number((amountCents / 100).toFixed(2)),
         payment_method: "pix",
         source_url: sourceUrl,
-        source_label: product,
-        description: `${product} - Pedido ${orderId}`,
+        source_label: sanitizeForOnyxpag(product),
+        description: sanitizeForOnyxpag(`${product} - Pedido ${orderId}`),
         items: [
           {
-            title: product,
+            title: sanitizeForOnyxpag(product),
             unitPrice: amountCents,
             quantity: 1,
             tangible: true,
