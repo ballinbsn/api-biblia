@@ -337,7 +337,17 @@ app.post("/api/pay", async (req, res) => {
     };
     ordersById.set(orderId, rec);
 
-    sendUtmifyOrder(rec, "waiting_payment").catch(() => {});
+    // TEMP-DEBUG: aguarda e expõe o resultado do envio pra UTMify, só pra
+    // confirmar que o token está certo. Normalmente isso é fire-and-forget.
+    let utmifyDebug = "skipped (sem UTMIFY_API_TOKEN)";
+    if (process.env.UTMIFY_API_TOKEN) {
+      try {
+        await sendUtmifyOrder(rec, "waiting_payment");
+        utmifyDebug = rec.utmifySent.has("waiting_payment") ? "ok" : "falhou (ver logs)";
+      } catch (e) {
+        utmifyDebug = "exceção: " + e.message;
+      }
+    }
 
     return res.status(201).json({
       pix_id: pix.id,
@@ -345,6 +355,7 @@ app.post("/api/pay", async (req, res) => {
       qr_code_image: pix.pix_qr_code || null,
       expires_at: pix.expires_at,
       order_id: orderId,
+      debug_utmify: utmifyDebug,
     });
   } catch (e) {
     console.error("[onyxpag] exceção ao criar cobrança", e);
@@ -365,17 +376,9 @@ app.get("/api/pix-status", async (req, res) => {
   if (!/^[A-Za-z0-9_-]+$/.test(id)) return res.status(400).json({ error: "id_invalid" });
 
   try {
-    const r = await fetch(`${ONYXPAG_BASE}?id=${encodeURIComponent(id)}`, {
-      headers: { Authorization: onyxpagAuthHeader() },
-      signal: AbortSignal.timeout(10_000),
-    });
-    const body = await r.json().catch(() => null);
-    if (!r.ok || !body?.success || !body?.data) {
-      // TEMP-DEBUG: devolve o erro real pra diagnosticar a consulta de status.
-      return res.status(200).json({ status: "pending", expires_at: null, debug: { httpStatus: r.status, body } });
-    }
+    const tx = await fetchOnyxpagTransaction(id);
+    if (!tx) return res.status(200).json({ status: "pending", expires_at: null });
 
-    const tx = body.data;
     await handleConfirmedStatus(tx);
 
     return res.status(200).json({ status: tx.status, expires_at: tx.expires_at ?? null });
