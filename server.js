@@ -341,8 +341,7 @@ app.post("/api/pay", async (req, res) => {
     };
     ordersById.set(orderId, rec);
 
-    // TEMP-DEBUG: confirmar de vez que o token novo da UTMify funciona.
-    const utmifyResult = await sendUtmifyOrder(rec, "waiting_payment");
+    sendUtmifyOrder(rec, "waiting_payment").catch(() => {});
 
     return res.status(201).json({
       pix_id: pix.id,
@@ -350,7 +349,6 @@ app.post("/api/pay", async (req, res) => {
       qr_code_image: pix.pix_qr_code || null,
       expires_at: pix.expires_at,
       order_id: orderId,
-      debug_utmify: utmifyResult,
     });
   } catch (e) {
     console.error("[onyxpag] exceção ao criar cobrança", e);
