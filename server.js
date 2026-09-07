@@ -318,8 +318,7 @@ app.post("/api/pay", async (req, res) => {
     const body = await r.json().catch(() => ({}));
     if (!r.ok || !body?.success || !body?.data) {
       console.error("[onyxpag] falha ao criar cobrança", r.status, JSON.stringify(body).slice(0, 800));
-      // TEMP-DEBUG: expõe o erro real da OnyxPag pra diagnosticar o 502.
-      return res.status(502).json({ error: "gateway_error", debug: { status: r.status, body } });
+      return res.status(502).json({ error: "gateway_error" });
     }
 
     const pix = body.data;
