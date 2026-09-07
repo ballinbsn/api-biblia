@@ -1,15 +1,15 @@
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
-import crypto from "node:crypto";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const PINPAY_BASE = "https://api.usepinpay.com/functions/v1/api-v1";
+const ONYXPAG_BASE = "https://api.onyxpag.com";
 const UTMIFY_ORDERS_URL = "https://api.utmify.com.br/api-credentials/orders";
 
 // CORS liberado pra qualquer origem — por decisão do projeto, sem restrição de domínio.
 app.use(cors());
+app.use(express.json());
 
 function onlyDigits(value) {
   return String(value || "").replace(/\D/g, "");
@@ -25,10 +25,8 @@ function utmifyDate(d = new Date()) {
   return d.toISOString().slice(0, 19).replace("T", " ");
 }
 
-// Extrai nosso order_id (SLH...) de qualquer string (description / product_name).
-function extractOrderId(s) {
-  const m = String(s || "").match(/\b(SLH[A-Za-z0-9]+)\b/);
-  return m ? m[1] : null;
+function formatCPF(digits) {
+  return digits.replace(/(\d{3})(\d{3})(\d{3})(\d{2})/, "$1.$2.$3-$4");
 }
 
 // Gera um CPF com dígitos verificadores válidos — fallback quando o front não
@@ -55,6 +53,12 @@ function genPhone() {
   return ddd + num;
 }
 
+// Basic Auth exigido pela OnyxPag: base64("chave_publica:chave_privada").
+function onyxpagAuthHeader() {
+  const raw = `${process.env.ONYXPAG_PUBLIC_KEY || ""}:${process.env.ONYXPAG_PRIVATE_KEY || ""}`;
+  return "Basic " + Buffer.from(raw).toString("base64");
+}
+
 /* ================================================================== */
 /* UTMify — envio de pedidos (rastreio de venda + conversão pro Meta).
    1 pedido é enviado em "waiting_payment" quando o Pix é gerado e
@@ -62,62 +66,18 @@ function genPhone() {
    o MESMO orderId. A UTMify só dispara Purchase pro Meta no "paid".
 
    O pedido fica guardado em memória por 24h, indexado pelo nosso orderId
-   (SLH...). A PinPay usa IDs diferentes em cada lugar (id da criação,
-   transaction_id no webhook, id na lista de transações), então indexamos
-   também o id do Pix e sempre conseguimos achar o pedido pelo orderId,
-   que aparece na descrição da cobrança. */
-const PAID_STATUSES = new Set([
-  "paid", "pago", "approved", "aprovado", "completed", "concluido", "concluída", "concluida",
-  "confirmed", "confirmado", "success", "sucesso", "payed", "authorized", "settled", "captured",
-]);
+   (SLH...), que também é mandado pra OnyxPag em metadata.order_id — ela
+   devolve isso como "external_ref" (na criação) ou "external_id" (no
+   webhook), então sempre conseguimos religar a transação da OnyxPag ao
+   nosso pedido. */
+const PAID_STATUSES = new Set(["pago", "paid", "aprovado", "approved"]);
+const FAILED_STATUSES = new Set(["expirado", "expired", "cancelado", "canceled", "cancelled"]);
 const ordersById = new Map(); // orderId (SLH...) -> rec
-const pixToOrder = new Map(); // id do Pix (criação) -> orderId
 
 setInterval(() => {
   const cutoff = Date.now() - 24 * 60 * 60 * 1000;
   for (const [k, v] of ordersById) if ((v.ts || 0) < cutoff) ordersById.delete(k);
-  for (const [k, oid] of pixToOrder) if (!ordersById.has(oid)) pixToOrder.delete(k);
 }, 60 * 60 * 1000).unref?.();
-
-function findRec({ orderId, pixId, description } = {}) {
-  return (
-    (orderId && ordersById.get(orderId)) ||
-    (pixId && pixToOrder.has(pixId) && ordersById.get(pixToOrder.get(pixId))) ||
-    (extractOrderId(description) && ordersById.get(extractOrderId(description))) ||
-    null
-  );
-}
-
-// Reconstrói o pedido a partir do metadata gravado na cobrança PinPay — pra
-// quando o pedido não está mais em memória (restart/deploy no meio do checkout).
-function recFromMeta(meta) {
-  meta = meta || {};
-  const orderId = meta.order_id || meta.external_reference;
-  if (!orderId) return null;
-  const rec = {
-    orderId,
-    createdAt: meta.created_at || utmifyDate(),
-    ts: Date.now(),
-    product: meta.product || "Bíblia de Estudo Para o Cotidiano da Mulher",
-    amountCents: Number(meta.amount_cents) || 0,
-    customer: {
-      name: meta.customer_name || "",
-      email: meta.customer_email || "",
-      phone: onlyDigits(meta.customer_phone) || null,
-      document: onlyDigits(meta.customer_cpf) || null,
-      ip: meta.client_ip || null,
-    },
-    tracking: {
-      src: meta.src || null, sck: meta.sck || null,
-      utm_source: meta.utm_source || null, utm_campaign: meta.utm_campaign || null,
-      utm_medium: meta.utm_medium || null, utm_content: meta.utm_content || null,
-      utm_term: meta.utm_term || null,
-    },
-    utmifySent: new Set(),
-  };
-  ordersById.set(orderId, rec);
-  return rec;
-}
 
 async function sendUtmifyOrder(rec, status, approvedDate = null) {
   if (!process.env.UTMIFY_API_TOKEN) return;
@@ -129,7 +89,7 @@ async function sendUtmifyOrder(rec, status, approvedDate = null) {
   const t = rec.tracking || {};
   const payload = {
     orderId: rec.orderId,
-    platform: "PinPay",
+    platform: "OnyxPag",
     paymentMethod: "pix",
     status,
     createdAt: rec.createdAt || utmifyDate(),
@@ -190,68 +150,43 @@ async function sendUtmifyOrder(rec, status, approvedDate = null) {
   }
 }
 
-/* ------------------------------------------------------------------ */
-/* O webhook precisa do corpo "cru" (raw) pra validar o HMAC — por isso
-   express.raw() e vem ANTES do express.json() global. */
-app.post("/api/webhooks/pinpay", express.raw({ type: "application/json" }), async (req, res) => {
-  if (!process.env.PINPAY_WEBHOOK_SECRET) {
-    console.error("[pinpay webhook] PINPAY_WEBHOOK_SECRET não configurado no ambiente");
-    return res.status(500).end();
+// Consulta a transação DIRETO na OnyxPag, com nossas próprias credenciais.
+// É a única fonte de verdade sobre status de pagamento — o webhook (abaixo)
+// não tem assinatura pra validar, então ele só dispara essa consulta em vez
+// de ser confiado diretamente. Retorna null se não achar/erro.
+async function fetchOnyxpagTransaction(transactionId) {
+  const r = await fetch(`${ONYXPAG_BASE}?id=${encodeURIComponent(transactionId)}`, {
+    headers: { Authorization: onyxpagAuthHeader() },
+    signal: AbortSignal.timeout(10_000),
+  });
+  if (!r.ok) {
+    console.error("[onyxpag] falha ao consultar transação", transactionId, r.status);
+    return null;
   }
+  const body = await r.json().catch(() => null);
+  if (!body?.success || !body?.data) return null;
+  return body.data;
+}
 
-  const signature = req.headers["x-webhook-signature"];
-  if (!signature) return res.status(401).end();
-
-  const expected =
-    "sha256=" +
-    crypto.createHmac("sha256", process.env.PINPAY_WEBHOOK_SECRET).update(req.body).digest("hex");
-  const sigBuffer = Buffer.from(signature);
-  const expectedBuffer = Buffer.from(expected);
-  const valid =
-    sigBuffer.length === expectedBuffer.length && crypto.timingSafeEqual(sigBuffer, expectedBuffer);
-  if (!valid) {
-    console.warn("[pinpay webhook] assinatura inválida, ignorando");
-    return res.status(401).end();
-  }
-
-  let payload;
-  try {
-    payload = JSON.parse(req.body.toString("utf8"));
-  } catch {
-    return res.status(400).end();
-  }
-
-  res.status(200).end(); // responde rápido; processa depois
-
-  const { event, data } = payload || {};
-  // deriva o nosso orderId de onde der: metadata, external_reference, ou a
-  // descrição/product_name (que contém "... - Pedido SLH...").
-  const orderId =
-    data?.metadata?.order_id ||
-    data?.external_reference ||
-    extractOrderId(data?.product_name) ||
-    extractOrderId(data?.description) ||
-    null;
-  const pixId = data?.transaction_id || data?.id || null;
-  // TEMP: aprende o formato do payload do webhook.
-  console.log("[pinpay webhook] payload", JSON.stringify(payload).slice(0, 1500));
-
-  let rec =
-    findRec({ orderId, pixId, description: data?.product_name || data?.description }) ||
-    recFromMeta(data?.metadata);
+// Depois de confirmar (via fetchOnyxpagTransaction) que uma transação está
+// paga de verdade, avisa a UTMify. Reconstrói o registro pelo external_ref
+// se o pedido não estiver mais em memória (restart no meio do checkout).
+async function handleConfirmedStatus(tx) {
+  if (!tx) return;
+  const orderId = tx.external_ref || tx.external_id || null;
+  let rec = orderId ? ordersById.get(orderId) : null;
   if (!rec && orderId) {
-    // não está mais em memória (restart) — monta o mínimo pelo payload do webhook.
     rec = {
       orderId,
-      createdAt: utmifyDate(),
+      createdAt: tx.created_at || utmifyDate(),
       ts: Date.now(),
-      product: data?.product_name || "Bíblia de Estudo Para o Cotidiano da Mulher",
-      amountCents: Number(data?.amount) || 0,
+      product: tx.items?.[0]?.title || "Bíblia de Estudo Para o Cotidiano da Mulher",
+      amountCents: Math.round(parseFloat(tx.amount || "0") * 100),
       customer: {
-        name: data?.customer_name || "",
-        email: data?.customer_email || "",
-        phone: onlyDigits(data?.customer_phone) || null,
-        document: onlyDigits(data?.customer_document) || null,
+        name: tx.customer?.name || "",
+        email: tx.customer?.email || "",
+        phone: onlyDigits(tx.customer?.phone) || null,
+        document: onlyDigits(tx.customer?.document) || null,
         ip: null,
       },
       tracking: {},
@@ -259,39 +194,50 @@ app.post("/api/webhooks/pinpay", express.raw({ type: "application/json" }), asyn
     };
     ordersById.set(orderId, rec);
   }
-
-  console.log("[pinpay webhook]", event, { orderId, pixId, hasRec: !!rec, amount: data?.amount });
-
-  switch (event) {
-    case "payment_approved":
-      if (rec) await sendUtmifyOrder(rec, "paid", utmifyDate());
-      else console.warn("[pinpay webhook] PAGO sem rec — não deu pra avisar a UTMify", { orderId, pixId });
-      break;
-    case "payment_failed":
-      if (rec) await sendUtmifyOrder(rec, "refused");
-      break;
-    case "payment_refunded":
-      if (rec) await sendUtmifyOrder(rec, "refunded");
-      break;
-    default:
-      break;
+  if (!rec) {
+    console.warn("[onyxpag] status confirmado sem conseguir religar ao pedido", tx.id);
+    return;
   }
-});
-/* ------------------------------------------------------------------ */
 
-app.use(express.json());
+  const status = String(tx.status || "").toLowerCase();
+  if (PAID_STATUSES.has(status)) {
+    await sendUtmifyOrder(rec, "paid", utmifyDate());
+  } else if (FAILED_STATUSES.has(status)) {
+    await sendUtmifyOrder(rec, status.startsWith("cancel") ? "refused" : "refused");
+  }
+}
+
+// Webhook da OnyxPag. ATENÇÃO: a doc da OnyxPag não define nenhuma
+// assinatura/HMAC pra provar que a chamada veio mesmo dela — então NUNCA
+// confiamos direto no "status" que vier no corpo. Usamos o webhook só como
+// aviso pra ir conferir; quem decide é sempre a consulta autenticada acima.
+app.post("/api/webhooks/onyxpag", async (req, res) => {
+  res.status(200).end(); // responde rápido; processa depois
+
+  const { event, data } = req.body || {};
+  const transactionId = data?.transaction_id || data?.id || null;
+  console.log("[onyxpag webhook]", event, { transactionId, external: data?.external_id });
+  if (!transactionId) return;
+
+  const tx = await fetchOnyxpagTransaction(transactionId);
+  if (!tx) {
+    console.warn("[onyxpag webhook] não confirmou a transação na consulta, ignorando", transactionId);
+    return;
+  }
+  await handleConfirmedStatus(tx);
+});
 
 // Cria a cobrança Pix pro pedido
 app.post("/api/pay", async (req, res) => {
-  if (!process.env.PINPAY_TOKEN) {
-    console.error("[pinpay] PINPAY_TOKEN não configurado no ambiente");
+  if (!process.env.ONYXPAG_PUBLIC_KEY || !process.env.ONYXPAG_PRIVATE_KEY) {
+    console.error("[onyxpag] ONYXPAG_PUBLIC_KEY/ONYXPAG_PRIVATE_KEY não configurados no ambiente");
     return res.status(500).json({ error: "server_misconfigured" });
   }
 
   const { product, amountReais, customer, address, tracking, checkoutUrl } = req.body || {};
 
-  const amount = Math.round(Number(amountReais) * 100);
-  if (!Number.isInteger(amount) || amount < 100) return res.status(400).json({ error: "amount_invalid" });
+  const amountCents = Math.round(Number(amountReais) * 100);
+  if (!Number.isInteger(amountCents) || amountCents < 100) return res.status(400).json({ error: "amount_invalid" });
   if (!product || typeof product !== "string") return res.status(400).json({ error: "product_invalid" });
 
   let cpf = onlyDigits(customer?.cpf);
@@ -306,75 +252,78 @@ app.post("/api/pay", async (req, res) => {
   if (!address?.cep || !address?.cidade || !address?.uf) {
     return res.status(400).json({ error: "address_invalid" });
   }
+  // source_url é obrigatório pra OnyxPag — precisa ser a página real do
+  // checkout, nunca um valor fixo. Sem isso nem tenta chamar a API.
+  const sourceUrl = String(checkoutUrl || "").trim();
+  if (!/^https?:\/\//i.test(sourceUrl)) return res.status(400).json({ error: "source_url_invalid" });
 
   const orderId = "SLH" + Date.now() + Math.random().toString(36).slice(2, 7);
   const createdAt = utmifyDate();
   const ip = clientIp(req);
   const t = tracking || {};
 
-  const enderecoResumo =
-    `${address.rua || ""}, ${address.numero || "s/n"}` +
-    (address.complemento ? ` - ${address.complemento}` : "") +
-    (address.bairro ? ` - ${address.bairro}` : "") +
-    `, ${address.cidade}/${address.uf} - CEP ${onlyDigits(address.cep)}`;
-
   try {
-    const r = await fetch(`${PINPAY_BASE}/pix`, {
+    const r = await fetch(ONYXPAG_BASE, {
       method: "POST",
       headers: {
-        Authorization: "Bearer " + process.env.PINPAY_TOKEN,
+        Authorization: onyxpagAuthHeader(),
         "Content-Type": "application/json",
-        "Idempotency-Key": orderId,
       },
       body: JSON.stringify({
-        amount,
+        // Valor total em REAIS (decimal) — a OnyxPag usa esse formato aqui,
+        // diferente de items[].unitPrice logo abaixo, que é em CENTAVOS.
+        amount: Number((amountCents / 100).toFixed(2)),
+        payment_method: "pix",
+        source_url: sourceUrl,
+        source_label: product,
         description: `${product} - Pedido ${orderId}`,
-        customer: { name, email, document: { type: "CPF", number: cpf }, phone },
-        expires_in: 900,
-        webhook_url: process.env.PINPAY_WEBHOOK_URL,
+        items: [
+          {
+            title: product,
+            unitPrice: amountCents,
+            quantity: 1,
+            tangible: true,
+          },
+        ],
+        customer: {
+          name,
+          email,
+          document: formatCPF(cpf),
+          phone,
+        },
+        postbackUrl: process.env.ONYXPAG_WEBHOOK_URL,
         metadata: {
-          external_reference: orderId,
           order_id: orderId,
-          checkout_url: checkoutUrl || "",
-          created_at: createdAt,
-          product,
-          amount_cents: String(amount),
-          endereco: enderecoResumo,
-          customer_name: name,
-          customer_email: email,
-          customer_phone: phone,
-          customer_cpf: cpf,
-          client_ip: ip || "",
-          src: t.src || "",
-          sck: t.sck || "",
-          utm_source: t.utm_source || "",
-          utm_campaign: t.utm_campaign || "",
-          utm_medium: t.utm_medium || "",
-          utm_content: t.utm_content || "",
-          utm_term: t.utm_term || "",
         },
       }),
       signal: AbortSignal.timeout(30_000),
     });
 
-    if (!r.ok) {
-      const err = await r.json().catch(() => ({}));
-      console.error("[pinpay] falha ao criar cobrança", r.status, err);
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok || !body?.success || !body?.data) {
+      console.error("[onyxpag] falha ao criar cobrança", r.status, JSON.stringify(body).slice(0, 800));
       return res.status(502).json({ error: "gateway_error" });
     }
 
-    const pix = await r.json();
-    const pixId = pix.id || pix.transaction_id || pix.pix?.id || null;
-    // TEMP: aprende o formato de id que a PinPay devolve na criação.
-    console.log("[pinpay] cobrança criada", { orderId, pixId, keys: Object.keys(pix || {}) });
+    const pix = body.data;
+    console.log("[onyxpag] cobrança criada", { orderId, transactionId: pix.id, status: pix.status });
+
+    // Endereço de entrega fica só com a gente — a OnyxPag não pede isso pra
+    // processar o Pix, mas precisamos guardar pra despachar o livro depois.
+    const enderecoResumo =
+      `${address.rua || ""}, ${address.numero || "s/n"}` +
+      (address.complemento ? ` - ${address.complemento}` : "") +
+      (address.bairro ? ` - ${address.bairro}` : "") +
+      `, ${address.cidade}/${address.uf} - CEP ${onlyDigits(address.cep)}`;
 
     const rec = {
       orderId,
       createdAt,
       ts: Date.now(),
       product,
-      amountCents: amount,
+      amountCents,
       customer: { name, email, phone, document: cpf, ip },
+      endereco: enderecoResumo,
       tracking: {
         src: t.src || null,
         sck: t.sck || null,
@@ -387,75 +336,43 @@ app.post("/api/pay", async (req, res) => {
       utmifySent: new Set(),
     };
     ordersById.set(orderId, rec);
-    if (pixId) pixToOrder.set(pixId, orderId);
 
     sendUtmifyOrder(rec, "waiting_payment").catch(() => {});
 
     return res.status(201).json({
-      pix_id: pixId,
-      qr_code: pix.pix?.qr_code,
-      qr_code_url: pix.pix?.qr_code_url,
-      expires_at: pix.pix?.expires_at,
+      pix_id: pix.id,
+      qr_code: pix.pix_code,
+      qr_code_image: pix.pix_qr_code || null,
+      expires_at: pix.expires_at,
       order_id: orderId,
     });
   } catch (e) {
-    console.error("[pinpay] exceção ao criar cobrança", e);
+    console.error("[onyxpag] exceção ao criar cobrança", e);
     return res.status(500).json({ error: "internal" });
   }
 });
 
-// O frontend consulta esse endpoint a cada poucos segundos.
-// Aceita ?id=<pix id> e/ou ?oid=<order id SLH...>.
+// O frontend consulta esse endpoint a cada poucos segundos. É a fonte de
+// verdade principal (webhook sem assinatura só complementa, nunca decide
+// sozinho). Aceita ?id=<transaction id>.
 app.get("/api/pix-status", async (req, res) => {
-  if (!process.env.PINPAY_TOKEN) {
-    console.error("[pinpay] PINPAY_TOKEN não configurado no ambiente");
+  if (!process.env.ONYXPAG_PUBLIC_KEY || !process.env.ONYXPAG_PRIVATE_KEY) {
+    console.error("[onyxpag] ONYXPAG_PUBLIC_KEY/ONYXPAG_PRIVATE_KEY não configurados no ambiente");
     return res.status(500).json({ error: "server_misconfigured" });
   }
 
   const id = typeof req.query?.id === "string" ? req.query.id : "";
-  const oid = typeof req.query?.oid === "string" ? req.query.oid : "";
-  if (!/^[A-Za-z0-9_-]+$/.test(id || oid || "")) return res.status(400).json({ error: "id_invalid" });
+  if (!/^[A-Za-z0-9_-]+$/.test(id)) return res.status(400).json({ error: "id_invalid" });
 
   try {
-    const r = await fetch(`${PINPAY_BASE}/transactions?limit=50`, {
-      headers: { Authorization: "Bearer " + process.env.PINPAY_TOKEN },
-      signal: AbortSignal.timeout(10_000),
-    });
-    if (!r.ok) {
-      const err = await r.json().catch(() => ({}));
-      console.error("[pinpay] falha ao consultar status", r.status, JSON.stringify(err));
-      return res.status(502).json({ error: "gateway_error" });
-    }
-
-    const list = await r.json();
-    const items = list.data || list.transactions || (Array.isArray(list) ? list : []);
-    const tx = items.find((x) => {
-      const cands = [x.id, x.transaction_id, x.external_reference, x.metadata?.order_id, x.pix?.id].map(String);
-      const desc = String(x.description || x.product_name || "");
-      return (
-        (id && cands.includes(id)) ||
-        (oid && (cands.includes(oid) || desc.includes(oid))) ||
-        (id && desc.includes(id))
-      );
-    });
-
+    const tx = await fetchOnyxpagTransaction(id);
     if (!tx) return res.status(200).json({ status: "pending", expires_at: null });
 
-    const status = String(tx.status || "").toLowerCase();
-    if (PAID_STATUSES.has(status)) {
-      const rec =
-        findRec({
-          orderId: oid || tx.metadata?.order_id || tx.external_reference,
-          pixId: id || tx.id,
-          description: tx.description || tx.product_name,
-        }) || recFromMeta(tx.metadata);
-      if (rec) sendUtmifyOrder(rec, "paid", utmifyDate()).catch(() => {});
-      else console.warn("[pinpay] pago no polling mas sem rec", { id, oid, txKeys: Object.keys(tx || {}) });
-    }
+    await handleConfirmedStatus(tx);
 
-    return res.status(200).json({ status: tx.status, expires_at: tx.pix?.expires_at ?? null });
+    return res.status(200).json({ status: tx.status, expires_at: tx.expires_at ?? null });
   } catch (e) {
-    console.error("[pinpay] exceção ao consultar status", e);
+    console.error("[onyxpag] exceção ao consultar status", e);
     return res.status(500).json({ error: "internal" });
   }
 });
@@ -464,6 +381,8 @@ app.get("/health", (req, res) => res.json({ ok: true }));
 
 app.listen(PORT, () => {
   console.log(`Backend Pix do checkout Sélah (Bíblia de Estudo Para o Cotidiano da Mulher) rodando na porta ${PORT}`);
-  if (!process.env.PINPAY_TOKEN) console.warn("⚠️  PINPAY_TOKEN não configurado.");
+  if (!process.env.ONYXPAG_PUBLIC_KEY || !process.env.ONYXPAG_PRIVATE_KEY) {
+    console.warn("⚠️  ONYXPAG_PUBLIC_KEY / ONYXPAG_PRIVATE_KEY não configurados.");
+  }
   if (!process.env.UTMIFY_API_TOKEN) console.warn("⚠️  UTMIFY_API_TOKEN não configurado — vendas não vão pra UTMify.");
 });

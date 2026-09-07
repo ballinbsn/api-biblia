@@ -1,7 +1,7 @@
 {
   "name": "biblia-feminina-checkout-backend",
   "version": "1.0.0",
-  "description": "Backend Pix (PinPay + UTMify) do checkout da Bíblia de Estudo Para o Cotidiano da Mulher — Sélah",
+  "description": "Backend Pix (OnyxPag + UTMify) do checkout da Bíblia de Estudo Para o Cotidiano da Mulher — Sélah",
   "type": "module",
   "main": "server.js",
   "engines": {
