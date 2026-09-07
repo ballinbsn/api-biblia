@@ -159,12 +159,12 @@ async function fetchOnyxpagTransaction(transactionId) {
     headers: { Authorization: onyxpagAuthHeader() },
     signal: AbortSignal.timeout(10_000),
   });
-  if (!r.ok) {
-    console.error("[onyxpag] falha ao consultar transação", transactionId, r.status);
+  const body = await r.json().catch(() => null);
+  if (!r.ok || !body?.success || !body?.data) {
+    // TEMP-DEBUG: loga o corpo pra diagnosticar por que a consulta falhou.
+    console.error("[onyxpag] falha ao consultar transação", transactionId, r.status, JSON.stringify(body).slice(0, 500));
     return null;
   }
-  const body = await r.json().catch(() => null);
-  if (!body?.success || !body?.data) return null;
   return body.data;
 }
 
@@ -365,9 +365,17 @@ app.get("/api/pix-status", async (req, res) => {
   if (!/^[A-Za-z0-9_-]+$/.test(id)) return res.status(400).json({ error: "id_invalid" });
 
   try {
-    const tx = await fetchOnyxpagTransaction(id);
-    if (!tx) return res.status(200).json({ status: "pending", expires_at: null });
+    const r = await fetch(`${ONYXPAG_BASE}?id=${encodeURIComponent(id)}`, {
+      headers: { Authorization: onyxpagAuthHeader() },
+      signal: AbortSignal.timeout(10_000),
+    });
+    const body = await r.json().catch(() => null);
+    if (!r.ok || !body?.success || !body?.data) {
+      // TEMP-DEBUG: devolve o erro real pra diagnosticar a consulta de status.
+      return res.status(200).json({ status: "pending", expires_at: null, debug: { httpStatus: r.status, body } });
+    }
 
+    const tx = body.data;
     await handleConfirmedStatus(tx);
 
     return res.status(200).json({ status: tx.status, expires_at: tx.expires_at ?? null });
