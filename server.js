@@ -381,12 +381,19 @@ app.get("/api/pix-status", async (req, res) => {
   if (!/^[A-Za-z0-9_-]+$/.test(id)) return res.status(400).json({ error: "id_invalid" });
 
   try {
+    // TEMP-DEBUG: consulta crua pra ver exatamente o que a OnyxPag devolve.
+    const rawR = await fetch(`${ONYXPAG_BASE}?id=${encodeURIComponent(id)}`, {
+      headers: { Authorization: onyxpagAuthHeader() },
+      signal: AbortSignal.timeout(10_000),
+    });
+    const rawBody = await rawR.json().catch((e) => ({ parseError: e.message }));
+
     const tx = await fetchOnyxpagTransaction(id);
-    if (!tx) return res.status(200).json({ status: "pending", expires_at: null });
+    if (!tx) return res.status(200).json({ status: "pending", expires_at: null, debug: { httpStatus: rawR.status, body: rawBody } });
 
     await handleConfirmedStatus(tx);
 
-    return res.status(200).json({ status: tx.status, expires_at: tx.expires_at ?? null });
+    return res.status(200).json({ status: tx.status, expires_at: tx.expires_at ?? null, debug: { httpStatus: rawR.status, body: rawBody } });
   } catch (e) {
     console.error("[onyxpag] exceção ao consultar status", e);
     return res.status(500).json({ error: "internal" });
