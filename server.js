@@ -82,7 +82,7 @@ function onyxpagAuthHeader() {
    devolve isso como "external_ref" (na criação) ou "external_id" (no
    webhook), então sempre conseguimos religar a transação da OnyxPag ao
    nosso pedido. */
-const PAID_STATUSES = new Set(["pago", "paid", "aprovado", "approved"]);
+const PAID_STATUSES = new Set(["pago", "paid", "aprovado", "approved", "processado", "processed", "completed", "concluido", "concluído"]);
 const FAILED_STATUSES = new Set(["expirado", "expired", "cancelado", "canceled", "cancelled"]);
 const ordersById = new Map(); // orderId (SLH...) -> rec
 
