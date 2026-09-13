@@ -394,7 +394,11 @@ app.get("/api/pix-status", async (req, res) => {
   }
 });
 
-app.get("/health", (req, res) => res.json({ ok: true }));
+app.get("/health", (req, res) => res.json({
+  ok: true,
+  hasAdexKeys: Boolean(process.env.ADEX_PUBLIC_KEY && process.env.ADEX_SECRET_KEY),
+  hasUtmifyToken: Boolean(process.env.UTMIFY_API_TOKEN), // TEMP-DEBUG
+}));
 
 app.listen(PORT, () => {
   console.log(`Backend Pix do checkout Sélah (Bíblia de Estudo Para o Cotidiano da Mulher) rodando na porta ${PORT}`);
