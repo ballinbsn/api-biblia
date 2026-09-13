@@ -179,6 +179,10 @@ async function fetchAdexTransaction(transactionId) {
 // paga de verdade, avisa a UTMify.
 async function handleConfirmedStatus(tx) {
   if (!tx) return;
+  // Confirmado testando: "external_id" que a Adex devolve é um UUID gerado
+  // por ELA, não o nosso orderId que mandamos na criação (ela ignora esse
+  // campo). Por isso a religação real é sempre pelo pixToOrder (indexado
+  // pelo "id" que a Adex devolveu na criação), nunca por external_id.
   const rec = findRec({ orderId: tx.external_id, pixId: tx.id });
   if (!rec) {
     console.warn("[adex] status confirmado sem conseguir religar ao pedido", tx.id, tx.external_id);
@@ -308,14 +312,19 @@ app.post("/api/pay", async (req, res) => {
       signal: AbortSignal.timeout(30_000),
     });
 
-    const charge = await r.json().catch(() => ({}));
-    if (!r.ok || !charge?.id) {
-      console.error("[adex] falha ao criar cobrança", r.status, JSON.stringify(charge).slice(0, 800));
-      // TEMP-DEBUG: expõe o erro real da Adex pra diagnosticar o 502.
-      return res.status(502).json({ error: "gateway_error", debug: { status: r.status, body: charge } });
+    // A resposta real de criação NÃO bate com a doc: os dados vêm dentro de
+    // "transaction" e "pix" (com "fee_amount"/"net_amount"/"expiresAt" em vez
+    // de "fee"/"netAmount"/"expirationDate" como a doc mostrava) — confirmado
+    // testando de verdade, não é erro de digitação nosso.
+    const body = await r.json().catch(() => ({}));
+    const tx = body?.transaction;
+    const pix = body?.pix;
+    if (!r.ok || !body?.success || !tx?.id) {
+      console.error("[adex] falha ao criar cobrança", r.status, JSON.stringify(body).slice(0, 800));
+      return res.status(502).json({ error: "gateway_error" });
     }
 
-    console.log("[adex] cobrança criada", { orderId, transactionId: charge.id, status: charge.status });
+    console.log("[adex] cobrança criada", { orderId, transactionId: tx.id, status: tx.status });
 
     // Endereço de entrega fica só com a gente — usado pra despachar o livro.
     const enderecoResumo =
@@ -344,15 +353,15 @@ app.post("/api/pay", async (req, res) => {
       utmifySent: new Set(),
     };
     ordersById.set(orderId, rec);
-    pixToOrder.set(charge.id, orderId);
+    pixToOrder.set(tx.id, orderId);
 
     sendUtmifyOrder(rec, "waiting_payment").catch(() => {});
 
     return res.status(201).json({
-      pix_id: charge.id,
-      qr_code: charge.pix?.qrCode || null,
+      pix_id: tx.id,
+      qr_code: pix?.qrCode || pix?.copyPaste || null,
       qr_code_image: null, // a Adex não devolve imagem pronta, só o EMV copia-e-cola
-      expires_at: charge.pix?.expirationDate || null,
+      expires_at: pix?.expiresAt || null,
       order_id: orderId,
     });
   } catch (e) {
@@ -373,19 +382,12 @@ app.get("/api/pix-status", async (req, res) => {
   if (!/^[A-Za-z0-9_-]+$/.test(id)) return res.status(400).json({ error: "id_invalid" });
 
   try {
-    // TEMP-DEBUG: consulta crua pra ver exatamente o que a Adex devolve.
-    const rawR = await fetch(`${ADEX_BASE}/pix-receive?transaction_id=${encodeURIComponent(id)}`, {
-      headers: adexHeaders(),
-      signal: AbortSignal.timeout(10_000),
-    });
-    const rawBody = await rawR.json().catch((e) => ({ parseError: e.message }));
-
     const tx = await fetchAdexTransaction(id);
-    if (!tx) return res.status(200).json({ status: "pending", expires_at: null, debug: { httpStatus: rawR.status, body: rawBody } });
+    if (!tx) return res.status(200).json({ status: "pending", expires_at: null });
 
     await handleConfirmedStatus(tx);
 
-    return res.status(200).json({ status: tx.status, expires_at: tx.expires_at ?? null, debug: { httpStatus: rawR.status, body: rawBody } });
+    return res.status(200).json({ status: tx.status, expires_at: tx.expires_at ?? null });
   } catch (e) {
     console.error("[adex] exceção ao consultar status", e);
     return res.status(500).json({ error: "internal" });
